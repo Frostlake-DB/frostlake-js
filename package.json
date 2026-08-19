@@ -1,0 +1,23 @@
+{
+  "name": "frostlake",
+  "version": "0.1.0",
+  "description": "Zero-dependency Node.js driver for Frostlake over its HTTP protocol",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./compat": "./compat.js"
+  },
+  "files": ["index.js", "compat.js"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test" },
+  "keywords": ["frostlake", "snowflake", "sql", "database", "driver", "client"],
+  "author": "MLorek",
+  "license": "Apache-2.0",
+  "homepage": "https://frostlake.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Frostlake-DB/frostlake-js.git"
+  },
+  "bugs": { "url": "https://github.com/Frostlake-DB/frostlake-js/issues" }
+}

@@ -7,10 +7,11 @@
  *   const connection = snowflake.createConnection({ host: "localhost", port: 18082, database: "MY_DB" });
  *   connection.connect((err, conn) => { ... });
  *   connection.execute({ sqlText: "SELECT ?", binds: [1], complete: (err, stmt, rows) => { ... } });
+ *   connection.execute({ sqlText: "A; B", parameters: { MULTI_STATEMENT_COUNT: 2 } });
  *
  * Covered: createConnection, connect/connectAsync, execute with sqlText/binds/complete
- * (rows as objects keyed by column name, like the SDK), destroy. Everything beyond
- * that basic surface is out of scope.
+ * (rows as objects keyed by column name, like the SDK, or arrays with rowMode: "array"),
+ * destroy. Everything beyond that basic surface is out of scope.
  */
 
 import { Connection as CoreConnection, FrostlakeError } from "./index.js";
@@ -41,8 +42,11 @@ class CompatConnection {
     return this;
   }
 
-  execute({ sqlText, binds = [], complete }) {
-    const run = this.#core.execute(sqlText, binds);
+  execute({ sqlText, binds = [], parameters, rowMode, complete }) {
+    // The account's own Node driver takes the statement count as a statement parameter on the
+    // execute options, so this facade takes it the same way. It applies to this request only.
+    const count = parameters?.MULTI_STATEMENT_COUNT;
+    const run = this.#core.execute(sqlText, binds, { multiStatementCount: count, rowMode });
     if (complete) {
       run.then(
         ({ rows, rowCount, columns }) => {

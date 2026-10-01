@@ -2,6 +2,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
+import http from "node:http";
 import { connect, substitute, FrostlakeError } from "../index.js";
 import snowflake from "../compat.js";
 
@@ -202,6 +203,8 @@ test("a look-alike count alias stays a query result", integration, async () => {
 
 test("multi-statement executes expose every result set", integration, async () => {
   const conn = await connect(dsn);
+  // A pack has to be asked for: a session takes one statement per request until it says otherwise.
+  await conn.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0");
   const r = await conn.execute("SELECT 1 AS A; SELECT 2 AS B");
   assert.deepEqual(r.rows, [{ A: 1 }]);
   assert.equal(r.resultSets.length, 2);
@@ -231,6 +234,30 @@ test("binary cells read back as Buffers", integration, async () => {
   assert.equal(columns[0].dataType, "BINARY");
   assert.ok(Buffer.isBuffer(rows[0].B));
   assert.deepEqual(rows[0].B, payload);
+  await conn.close();
+});
+
+test("text and binary columns report their declared width", integration, async (t) => {
+  const conn = await connect(dsn);
+  await conn.execute("CREATE OR REPLACE DATABASE js_width_db");
+  await conn.execute("USE DATABASE js_width_db");
+  await conn.execute("CREATE TABLE widths (s VARCHAR(9), b BINARY(5), n NUMBER(10,2), u VARCHAR)");
+  const { columns } = await conn.execute("SELECT s, b, n, u FROM widths");
+  // An engine that predates the field sends no width at all, and this driver
+  // supports those: with nothing to report the checks below are skipped rather
+  // than passed, so a green tick never claims a width the wire never carried.
+  if (columns[0].length === null) {
+    await conn.close();
+    t.skip("this engine sends no column length");
+    return;
+  }
+  // Characters for the text column, bytes for the binary one.
+  assert.equal(columns[0].length, 9);
+  assert.equal(columns[1].length, 5);
+  // Every other type carries no width at all: null, never 0.
+  assert.equal(columns[2].length, null);
+  // Declared without a width, a text column still reports the maximum.
+  assert.equal(columns[3].length, 16777216);
   await conn.close();
 });
 
@@ -284,4 +311,174 @@ test("snowflake-sdk compat facade", integration, async () => {
       },
     });
   });
+});
+
+// A stub engine that keeps every execute body, so what the driver PUTS ON THE WIRE is checked
+// rather than only what comes back.
+async function recordingEngine(bodies) {
+  const srv = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      if (req.url === "/api/execute") {
+        bodies.push(JSON.parse(raw));
+        res.end(JSON.stringify({ success: true, sessionId: "s1", resultSets: [] }));
+      } else {
+        res.end(JSON.stringify({ status: "healthy" }));
+      }
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  return { srv, dsn: `frostlake://127.0.0.1:${srv.address().port}` };
+}
+
+test("a request carries no statement count unless the caller asks for one", async () => {
+  const bodies = [];
+  const { srv, dsn: stub } = await recordingEngine(bodies);
+  const conn = await connect(stub);
+  await conn.execute("SELECT 1");
+  await conn.execute("SELECT 1; SELECT 2", [], { multiStatementCount: 2 });
+  await conn.execute("SELECT 1; SELECT 2", [], { multiStatementCount: 0 });
+  await conn.close();
+  srv.close();
+  assert.equal("multiStatementCount" in bodies[0], false, "an unasked request declared a count");
+  assert.equal(bodies[1].multiStatementCount, 2);
+  // Zero is a real answer - "any number" - not nothing to say.
+  assert.equal(bodies[2].multiStatementCount, 0);
+});
+
+test("the sdk-shaped facade takes the count as a statement parameter", async () => {
+  const bodies = [];
+  const { srv, dsn: stub } = await recordingEngine(bodies);
+  const url = new URL(stub.replace("frostlake://", "http://"));
+  const conn = snowflake.createConnection({ host: url.hostname, port: Number(url.port) });
+  await conn.connectAsync();
+  await conn.execute({ sqlText: "SELECT 1; SELECT 2", parameters: { MULTI_STATEMENT_COUNT: 2 } });
+  await conn.execute({ sqlText: "SELECT 1" });
+  srv.close();
+  assert.equal(bodies[0].multiStatementCount, 2);
+  assert.equal("multiStatementCount" in bodies[1], false);
+});
+
+test("a pack runs on the caller's own count, leaving the session alone", integration, async (t) => {
+  const conn = await connect(dsn);
+  const packed = await conn.execute("SELECT 1 AS a; SELECT 2 AS b", [], { multiStatementCount: 2 });
+  assert.ok(packed);
+  // Nothing was changed on the session, so a pack nobody asked for is still refused.
+  //
+  // Only an engine carrying the statement-count gate refuses one at all, and this driver
+  // supports older ones. Against one of those the refusal never comes, so the check is
+  // skipped rather than passed: a green tick would claim an engine had been checked for
+  // a refusal it does not make.
+  let gated = true;
+  try {
+    await conn.execute("SELECT 1; SELECT 2");
+    gated = false;
+  } catch { /* the gate refused it, as the assertion below spells out */ }
+  if (!gated) {
+    await conn.close();
+    t.skip("this engine accepts a pack nobody asked for, so it has no refusal to assert");
+    return;
+  }
+  await assert.rejects(() => conn.execute("SELECT 1; SELECT 2"), /did not match the desired statement count/);
+  await conn.close();
+});
+
+// A stub engine that answers every execute with one canned reply, so a row shape the server
+// sends can be checked with no engine running.
+async function answeringEngine(reply) {
+  const srv = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.url === "/api/execute" ? reply : { status: "healthy" }));
+    });
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  return { srv, dsn: `frostlake://127.0.0.1:${srv.address().port}` };
+}
+
+test("array rows keep columns that share a name apart", async () => {
+  const { srv, dsn: stub } = await answeringEngine({
+    success: true,
+    sessionId: "s1",
+    resultSets: [{
+      columns: [
+        { name: "ID", dataType: "NUMBER" },
+        { name: "ID", dataType: "NUMBER" },
+        { name: "B", dataType: "BINARY" },
+      ],
+      rows: [[1, 2, "DEAD"], [3, null, null]],
+      rowCount: 2,
+      updateCount: -1,
+    }],
+  });
+  try {
+    const conn = await connect(stub);
+    const arrays = await conn.execute("SELECT a.id, b.id, a.b FROM a JOIN b", [], { rowMode: "array" });
+    assert.deepEqual(arrays.columns.map((c) => c.name), ["ID", "ID", "B"]);
+    assert.deepEqual(arrays.rows, [[1, 2, Buffer.from([0xde, 0xad])], [3, null, null]]);
+    assert.equal(arrays.rowCount, 2);
+    assert.deepEqual(arrays.resultSets[0].rows, arrays.rows);
+    // Keyed by name, the first ID is lost to the second: the default shape is unchanged.
+    const objects = await conn.execute("SELECT a.id, b.id, a.b FROM a JOIN b");
+    assert.deepEqual(objects.rows, [{ ID: 2, B: Buffer.from([0xde, 0xad]) }, { ID: null, B: null }]);
+    await assert.rejects(conn.execute("SELECT 1", [], { rowMode: "tuple" }), /rowMode must be "object" or "array"/);
+    await conn.close();
+    const url = new URL(stub.replace("frostlake://", "http://"));
+    const facade = snowflake.createConnection({ host: url.hostname, port: Number(url.port) });
+    await facade.connectAsync();
+    const rows = await new Promise((resolve, reject) => {
+      facade.execute({
+        sqlText: "SELECT a.id, b.id, a.b FROM a JOIN b",
+        rowMode: "array",
+        complete: (err, stmt, got) => (err ? reject(err) : resolve(got)),
+      });
+    });
+    assert.deepEqual(rows, [[1, 2, Buffer.from([0xde, 0xad])], [3, null, null]]);
+  } finally {
+    srv.close();
+  }
+});
+
+test("array rows still fold a DML count grid into rowCount", async () => {
+  const { srv, dsn: stub } = await answeringEngine({
+    success: true,
+    sessionId: "s1",
+    resultSets: [{
+      columns: [
+        { name: "number of rows inserted", dataType: "NUMBER" },
+        { name: "number of rows updated", dataType: "NUMBER" },
+      ],
+      rows: [[2, 1]],
+      rowCount: 1,
+      updateCount: 3,
+    }],
+  });
+  try {
+    const conn = await connect(stub);
+    const merge = await conn.execute(
+      "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)",
+      [], { rowMode: "array" });
+    assert.deepEqual(merge.columns, []);
+    assert.deepEqual(merge.rows, []);
+    assert.equal(merge.rowCount, 3);
+    await conn.close();
+  } finally {
+    srv.close();
+  }
+});
+
+test("a self-join's same-named columns both read back as arrays", integration, async () => {
+  const conn = await connect(dsn);
+  await conn.execute("CREATE OR REPLACE DATABASE js_rowmode_db");
+  await conn.execute("USE DATABASE js_rowmode_db");
+  await conn.execute("CREATE TABLE emp (id INTEGER, name VARCHAR, mgr_id INTEGER)");
+  await conn.execute("INSERT INTO emp VALUES (1, 'CEO', NULL), (2, 'Alice', 1), (3, 'Bob', 1)");
+  const { columns, rows } = await conn.execute(
+    "SELECT e.name, m.name FROM emp e JOIN emp m ON e.mgr_id = m.id ORDER BY e.id", [], { rowMode: "array" });
+  assert.deepEqual(columns.map((c) => c.name), ["NAME", "NAME"]);
+  assert.deepEqual(rows, [["Alice", "CEO"], ["Bob", "CEO"]]);
+  await conn.close();
 });

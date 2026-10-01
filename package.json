@@ -1,6 +1,6 @@
 {
   "name": "frostlake",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Zero-dependency Node.js driver for Frostlake over its HTTP protocol",
   "type": "module",
   "main": "index.js",

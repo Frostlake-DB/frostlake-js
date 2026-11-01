@@ -447,6 +447,11 @@ export function substitute(sql, binds) {
       const j = skipLine(sql, i);
       out += sql.slice(i, j);
       i = j - 1;
+    } else if (NAME_START.test(ch)) {
+      // a name is read whole, as the lexer reads one: the $$ in a$$b opens no dollar-quoted body
+      const j = skipName(sql, i);
+      out += sql.slice(i, j);
+      i = j - 1;
     } else if (ch === "$" && sql[i + 1] === "$") {
       // dollar-quoted string — non-greedy to the next $$, like the lexer's
       // DOLLAR_QUOTED_STRING: '$$' .*? '$$'
@@ -491,9 +496,23 @@ function skipQuoted(s, i, q) {
   return j;
 }
 
+// A line comment ends at a line feed or a carriage return, whichever comes first, as the
+// lexer's LINE_COMMENT does: ('--' | '//') ~[\r\n]*. The line end itself is left unread.
 function skipLine(s, i) {
-  const j = s.indexOf("\n", i);
-  return j < 0 ? s.length : j + 1;
+  let j = i;
+  while (j < s.length && s[j] !== "\n" && s[j] !== "\r") j++;
+  return j;
+}
+
+const NAME_START = /[A-Za-z_]/;
+const NAME_PART = /[A-Za-z0-9_$]/;
+
+// The end of the name that starts at i, read as the lexer reads an IDENTIFIER:
+// [a-zA-Z_][a-zA-Z0-9_$]*.
+function skipName(s, i) {
+  let j = i + 1;
+  while (j < s.length && NAME_PART.test(s[j])) j++;
+  return j;
 }
 
 function encodeString(text) {
@@ -504,8 +523,12 @@ export function formatLiteral(v) {
   if (v === null || v === undefined) return "NULL";
   switch (typeof v) {
     case "boolean": return String(v);
-    case "number": return Number.isFinite(v) ? String(v) : raise(`non-finite number ${v}`);
-    case "bigint": return v.toString();
+    // A negative number goes in parentheses, which is one value wherever it lands: bare,
+    // 3-? would become 3--5, a comment, and ?::VARCHAR would cast before it negates.
+    case "number":
+      if (!Number.isFinite(v)) return raise(`non-finite number ${v}`);
+      return v < 0 ? `(${v})` : String(v);
+    case "bigint": return v < 0n ? `(${v})` : v.toString();
     case "string": return encodeString(v);
     case "object":
       if (v instanceof Date) return `'${v.toISOString().replace("Z", "")}'::TIMESTAMP_NTZ`;
@@ -539,6 +562,8 @@ const TEMPORARY_MODIFIERS = new Set(["TEMPORARY", "TEMP", "VOLATILE"]);
 function skipNonCode(sql, i) {
   const ch = sql[i];
   const next = sql[i + 1];
+  // A name holds no separator, and the $$ inside one opens no body.
+  if (NAME_START.test(ch)) return skipName(sql, i);
   if (ch === "'") return skipString(sql, i);
   if (ch === '"') return skipQuoted(sql, i, '"');
   if ((ch === "-" && next === "-") || (ch === "/" && next === "/")) return skipLine(sql, i);

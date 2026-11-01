@@ -15,6 +15,26 @@ test("substitute passes an unterminated dollar-quote through", () => {
   assert.equal(substitute("SELECT $$a?b", []), "SELECT $$a?b");
 });
 
+test("substitute writes a negative number in parentheses", () => {
+  assert.equal(substitute("SELECT 3-?", [-5]), "SELECT 3-(-5)");
+  assert.equal(substitute("SELECT ?::VARCHAR", [-5]), "SELECT (-5)::VARCHAR");
+  assert.equal(substitute("SELECT ?, ?", [-1.5, -7n]), "SELECT (-1.5), (-7)");
+  assert.equal(substitute("SELECT ?, ?, ?", [5, 0, 7n]), "SELECT 5, 0, 7");
+  assert.equal(formatLiteral([1, -2]), "[1, (-2)]");
+});
+
+test("substitute reads a name whole: the $$ inside one opens no body", () => {
+  assert.equal(substitute("SELECT 1 AS a$$b, ?", [7]), "SELECT 1 AS a$$b, 7");
+  assert.equal(substitute("SELECT a$$b, ? FROM t$$ WHERE c$ = ?", [7, 8]), "SELECT a$$b, 7 FROM t$$ WHERE c$ = 8");
+  assert.equal(substitute("SELECT $$a?b$$, x$$, ?", [7]), "SELECT $$a?b$$, x$$, 7");
+});
+
+test("substitute ends a line comment at a carriage return", () => {
+  assert.equal(substitute("SELECT 1 -- c\r, ?", [7]), "SELECT 1 -- c\r, 7");
+  assert.equal(substitute("SELECT 1 // c?\r\n, ?", [7]), "SELECT 1 // c?\r\n, 7");
+  assert.equal(substitute("SELECT 1 -- c?\n, ?", [7]), "SELECT 1 -- c?\n, 7");
+});
+
 test("substitute throws when binds run out", () => {
   assert.throws(() => substitute("SELECT ?, ?", [1]), FrostlakeError);
 });
